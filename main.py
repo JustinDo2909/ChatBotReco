@@ -1,3 +1,6 @@
+import eventlet
+eventlet.monkey_patch()
+from flask import Flask, request, jsonify
 import pickle
 import re
 import numpy as np
@@ -5,6 +8,8 @@ import pandas as pd
 import google.generativeai as genai
 from sklearn.metrics.pairwise import cosine_similarity
 from train_model import get_bert_embedding
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 
 # --- Load dữ liệu ---
 with open("model-state.bin", "rb") as f:
@@ -37,8 +42,8 @@ def classify_question_types(user_question):
     
     try:
         response = model.generate_content(
-            f"Phân tích câu hỏi và liệt kê TẤT CẢ loại phù hợp (chỉ trả lời tên loại, cách nhau bằng dấu phẩy): '{user_question}'\n"
-            f"Danh sách loại: {', '.join(type_list)}\n"
+            f"Phân tích câu hỏi và liệt kê TẤT CẢ loại phù hợp (chỉ trả lời tên loại, cách nhau bằng dấu phẩy): '{user_question}'"
+            f"Danh sách loại: {', '.join(type_list)}"
             "Ví dụ: 'Hỏi giá sản phẩm, Hỏi về khuyến mãi'"
         )
         if response and response.parts:
@@ -67,7 +72,6 @@ def handle_price_inquiry(question, product_name=None):
     return f"{products.iloc[0]['Tên sản phẩm']} có giá {products.iloc[0]['Giá']:,.0f} VND."
 
 def handle_promotion_inquiry(question):
-    # Giả lập dữ liệu khuyến mãi (có thể thay bằng API thực tế)
     promotions = {
         "iphone": "Giảm 10% khi mua kèm Apple Care",
         "samsung": "Tặng phiếu mua hàng 1 triệu",
@@ -83,12 +87,11 @@ def handle_product_search(question):
     if products.empty:
         return "Không tìm thấy sản phẩm phù hợp."
     
-    response = "Có thể bạn quan tâm:\n"
+    response = "Có thể bạn quan tâm:"
     for _, row in products.head(3).iterrows():
-        response += f"- {row['Tên sản phẩm']} ({row['Giá']:,.0f} VND) ({row['Hình']})\n"
+        response += f"- {row['Tên sản phẩm']} ({row['Giá']:,.0f} VND) ({row['Hình']})"
     return response
 
-# --- Tổng hợp câu trả lời ---
 def generate_combined_response(question, partial_responses):
     prompt = f"""
     Tổng hợp các thông tin sau thành câu trả lời tự nhiên:
@@ -110,12 +113,10 @@ def generate_combined_response(question, partial_responses):
 
 # --- Hàm chính ---
 def find_best_match(user_question):
-    # Bước 1: Phân loại đa nhiệm
     question_types = classify_question_types(user_question)
     if not question_types:
         return ask_gemini_directly(user_question)
     
-    # Bước 2: Xử lý từng loại
     partial_responses = []
     for q_type in question_types:
         if q_type == "Hỏi giá sản phẩm":
@@ -124,34 +125,25 @@ def find_best_match(user_question):
             partial_responses.append(handle_promotion_inquiry(user_question))
         elif q_type == "Tìm sản phẩm":
             partial_responses.append(handle_product_search(user_question))
-        # Thêm các loại khác tại đây...
     
-    # Bước 3: Tổng hợp thông minh
     return generate_combined_response(user_question, partial_responses)
 
 # --- Các hàm phụ trợ ---
 def extract_price_range(text):
-    """Extract price range from user question"""
     text = text.lower().replace(",", "").replace(".", "")
-    
-    # Pattern to match numbers with optional units
     pattern = r"(\d+)(?:\s*(k|nghìn|triệu|tr|vnd))?"
     matches = re.findall(pattern, text)
-    
     prices = []
     for num, unit in matches:
         num = float(num)
-        
         if unit in ["k", "nghìn"]:
             num *= 1000
         elif unit in ["triệu", "tr"]:
             num *= 1000000
         elif unit == "vnd":
-            pass  # already in VND
-            
+            pass
         prices.append(num)
     
-    # Determine price range based on question wording
     if "dưới" in text and prices:
         return 0, min(prices)
     elif "trên" in text and prices:
@@ -164,12 +156,9 @@ def extract_price_range(text):
     return None, None
 
 def find_relevant_products(user_question):
-    """Find relevant products based on user question"""
     try:
         user_embedding = get_bert_embedding(user_question)
         similarities = cosine_similarity(user_embedding, product_embeddings)
-        
-        # Get top 5 most similar products
         best_idxs = np.argsort(similarities[0])[-5:][::-1]
         best_idxs = [idx for idx in best_idxs if idx < len(product_data)]
         
@@ -177,26 +166,22 @@ def find_relevant_products(user_question):
             return None
             
         return product_data.iloc[best_idxs]
-        
     except Exception as e:
         print("Lỗi khi tìm sản phẩm:", str(e))
         return None
 
 def ask_gemini_directly(user_question):
-    """Ask Gemini directly when no good match is found"""
     try:
-        # Prepare context from FAQ and product data
         context = ""
-        
         if not faq_data.empty:
-            context += "Thông tin Câu hỏi thường gặp:\n"
+            context += "Thông tin Câu hỏi thường gặp:"
             for _, row in faq_data.iterrows():
-                context += f"Q: {row['Câu hỏi']}\nA: {row['Câu trả lời']}\n\n"
+                context += f"Q: {row['Câu hỏi']}A: {row['Câu trả lời']}"
         
         if not product_data.empty:
-            context += "\nThông tin Sản phẩm:\n"
-            for _, row in product_data.head(5).iterrows():  # Include some product info
-                context += f"{row['Tên sản phẩm']} - {row['Giá']:,.0f} VND\n"
+            context += "Thông tin Sản phẩm:"
+            for _, row in product_data.head(5).iterrows():
+                context += f"{row['Tên sản phẩm']} - {row['Giá']:,.0f} VND"
         
         prompt = f"""Bạn là trợ lý ảo của cửa hàng RECO. Hãy trả lời câu hỏi dựa trên thông tin sau:
 
@@ -216,13 +201,36 @@ Hướng dẫn:
         print("Lỗi khi hỏi Gemini:", str(e))
         return "Xin lỗi, có lỗi khi xử lý câu hỏi của bạn."
 
-# --- Chatbot loop ---
-print("Chatbot: Xin chào! Tôi có thể giúp gì cho bạn?")
-while True:
-    user_input = input("Bạn: ").strip()
-    if user_input.lower() in ["thoát", "exit", "quit"]:
-        print("Chatbot: Cảm ơn bạn đã sử dụng dịch vụ!")
-        break
-    
-    response = find_best_match(user_input)
-    print(f"Chatbot: {response}")
+
+# --- Khởi tạo Flask ---
+app = Flask(__name__)
+CORS(app, origins=["http://localhost:3000"], supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins=["http://localhost:3000"], async_mode='eventlet')
+
+# --- Route xử lý câu hỏi ---
+@app.route('/ask', methods=['POST'])
+def ask_question():
+    user_question = request.json.get('question')
+    if not user_question:
+        return jsonify({'error': 'Câu hỏi không hợp lệ'}), 400
+
+    # Gọi hàm xử lý thực sự
+    response = find_best_match(user_question)
+
+    # Gửi kết quả về WebSocket
+    socketio.emit('bot_response', {'response': response})
+
+    return jsonify({'response': response})
+
+# --- WebSocket events ---
+@socketio.on('connect')
+def handle_connect():
+    print("Client connected")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print("Client disconnected")
+
+# --- Chạy server ---
+if __name__ == '__main__':
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
