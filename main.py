@@ -1,5 +1,6 @@
 import eventlet
 eventlet.monkey_patch()
+
 from flask import Flask, request, jsonify
 import pickle
 import re
@@ -10,6 +11,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 from train_model import get_bert_embedding
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+from PIL import Image
+import torch
+import torchvision.transforms as transforms
+import base64
+from io import BytesIO
+import torch.nn as nn
+import torch.nn.functional as F
 
 # --- Load dữ liệu ---
 with open("model-state.bin", "rb") as f:
@@ -163,12 +171,12 @@ def find_relevant_products(user_question):
         best_idxs = [idx for idx in best_idxs if idx < len(product_data)]
         
         if not best_idxs:
-            return None
+            return pd.DataFrame()
             
         return product_data.iloc[best_idxs]
     except Exception as e:
         print("Lỗi khi tìm sản phẩm:", str(e))
-        return None
+        return pd.DataFrame()
 
 def ask_gemini_directly(user_question):
     try:
@@ -201,36 +209,207 @@ Hướng dẫn:
         print("Lỗi khi hỏi Gemini:", str(e))
         return "Xin lỗi, có lỗi khi xử lý câu hỏi của bạn."
 
-
 # --- Khởi tạo Flask ---
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:3000"], supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins=["http://localhost:3000"], async_mode='eventlet')
 
-# --- Route xử lý câu hỏi ---
-@app.route('/ask', methods=['POST'])
-def ask_question():
-    user_question = request.json.get('question')
-    if not user_question:
-        return jsonify({'error': 'Câu hỏi không hợp lệ'}), 400
+# --- Định nghĩa các phép biến đổi --- #
+new_transform = transforms.Compose([transforms.Resize((32, 32)),
+                                    transforms.ToTensor(),
+                                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
-    # Gọi hàm xử lý thực sự
-    response = find_best_match(user_question)
+class NeuralNet(nn.Module):
+    def __init__(self):
+        super(NeuralNet, self).__init__()
+        self.conv1 = nn.Conv2d(3, 12, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(12, 24, 5)
+        self.fc1 = nn.Linear(24 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 6)
 
-    # Gửi kết quả về WebSocket
-    socketio.emit('bot_response', {'response': response})
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = torch.flatten(x, 1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
-    return jsonify({'response': response})
+net = NeuralNet()
+net.load_state_dict(torch.load('trained_model.pth'))
+net.eval()
 
-# --- WebSocket events ---
+class_name = ['Backpack', 'Crossbody Bag', 'Handbag', 'Shoulder Bag', 'Tote Bag', 'clutch bag']
+
+# # Hàm load hình ảnh
+# def load_image(image_data):
+#     image = Image.open(BytesIO(base64.b64decode(image_data))).convert("RGB")
+#     image = new_transform(image)
+#     image = image.unsqueeze(0)  # Thêm chiều batch vào (nếu cần)
+#     return image
+
+# --- Hàm xử lý ảnh ---
+def process_image(image_data):
+    try:
+        # Xử lý base64 (bỏ phần header nếu có)
+        if ',' in image_data:
+            image_data = image_data.split(',')[1]
+        
+        image = Image.open(BytesIO(base64.b64decode(image_data))).convert("RGB")
+        image = new_transform(image).unsqueeze(0)
+        return image
+    except Exception as e:
+        print(f"Error processing image: {str(e)}")
+        raise
+
+# --- Hàm dự đoán ---
+def predict_image(image_tensor):
+    with torch.no_grad():
+        outputs = net(image_tensor)
+        _, predicted = torch.max(outputs.data, 1)
+        return class_name[predicted.item()]
+
+# --- Hàm gọi Gemini ---
+def generate_product_description(product_class):
+    similar_products = find_similar_products(product_class)
+    prompt = f"""
+    Bạn là trợ lý ảo cho cửa hàng thời trang RECO. Hãy tạo 1 dòng mô tả sản phẩm hấp dẫn với các thông tin sau:
+    {similar_products}
+    
+    note : không cần trả về hình ảnh, chỉ ghi giới thiệu thôi
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text if response else "Sản phẩm chất lượng cao, thiết kế thời thượng"
+    except Exception as e:
+        print(f"Gemini error: {str(e)}")
+        return "Mô tả sản phẩm đang được cập nhật"
+
+# --- Hàm tìm sản phẩm tương tự ---
+def find_similar_products(product_class, top_n=3):
+    try:
+        similar = product_data[product_data['Loại túi'].str.contains(product_class, case=False, na=False)]
+        if similar.empty:
+            return []
+            
+        similar = similar.sort_values('Giá', ascending=False).head(top_n)
+        return similar[['Tên sản phẩm', 'Giá', 'Hình']].to_dict('records')
+    except Exception as e:
+        print(f"Error finding similar products: {str(e)}")
+        return []
+
+# --- SocketIO Events ---
 @socketio.on('connect')
 def handle_connect():
-    print("Client connected")
+    print('Client connected:', request.sid)
+    emit('connection_response', {'status': 'connected', 'message': 'Kết nối thành công với RECO AI'})
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    print("Client disconnected")
+    print('Client disconnected:', request.sid)
 
-# --- Chạy server ---
+@socketio.on('ask_question')
+def handle_image_upload(data):
+    try:
+        # Gửi trạng thái đang xử lý
+        emit('processing_status', {
+            'status': 'processing',
+            'message': 'Đang phân tích hình ảnh...'
+        })
+
+        # 1. Nhận ảnh và xử lý thành tensor
+        image_tensor = process_image(data['image'])
+
+        # 2. Dự đoán loại sản phẩm
+        product_class = predict_image(image_tensor)
+
+        emit('processing_status', {
+            'status': 'classified',
+            'message': f'Đã nhận diện: {product_class}'
+        })
+
+        # 3. Gọi hàm sinh mô tả và lấy ảnh gợi ý
+        description = generate_product_description(product_class)
+        similar_products = find_similar_products(product_class, top_n=3)
+        image_paths = [item['Hình'] for item in similar_products]
+
+        # 4. Trả kết quả cuối cùng
+        emit('prediction_result', {
+            'product_class': product_class,
+            'description': description,
+            'image_path': image_paths  # mảng ảnh
+        })
+
+    except Exception as e:
+        print(f"Error in image processing: {str(e)}")
+        emit('prediction_error', {
+            'error': str(e)
+        })
+
+   
+@app.route('/upload-image', methods=['POST'])
+def upload_image():
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image file uploaded'}), 400
+
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    try:
+        image = Image.open(file).convert("RGB")
+        image_tensor = new_transform(image).unsqueeze(0)
+        prediction = predict_image(image_tensor)
+        description = generate_product_description(prediction)
+        similar_products = find_similar_products(prediction, top_n=3)
+        image_paths = [item['Hình'] for item in similar_products]
+        return jsonify({'prediction': prediction, 'description': description , 'image_path': image_paths}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+     
+# --- Route xử lý câu hỏi --- #
+@app.route('/ask', methods=['POST'])
+def ask_question():
+    try:
+        # --- 1. Lấy dữ liệu từ yêu cầu gửi lên ---
+        user_question = request.form.get('question')
+        image_file = request.files.get('image')
+
+        prediction = None
+        description = None
+        similar_products = []
+        image_paths = []
+
+        # --- 2. Nếu có ảnh thì phân tích ---
+        if image_file:
+            image = Image.open(image_file).convert("RGB")
+            image_tensor = new_transform(image).unsqueeze(0)
+            prediction = predict_image(image_tensor)
+            description = generate_product_description(prediction)
+            similar_products = find_similar_products(prediction, top_n=3)
+            image_paths = [item['Hình'] for item in similar_products]
+
+        # --- 3. Nếu có câu hỏi thì xử lý tìm câu trả lời ---
+        answer = None
+        if user_question:
+            answer = find_best_match(user_question)
+
+        # --- 4. Trả về kết quả ---
+        return jsonify({
+            'question': user_question,
+            'answer': answer,
+            'prediction': prediction,
+            'description': description,
+            'similar_products': similar_products,
+            'similar_image_paths': image_paths
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# --- Run server --- #
 if __name__ == '__main__':
-    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
+    socketio.run(app, host='0.0.0.0', port=5000)
