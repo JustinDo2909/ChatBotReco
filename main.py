@@ -112,6 +112,7 @@ def generate_combined_response(question, partial_responses):
     - Viết ngắn gọn, thân thiện
     - Giữ nguyên thông tin quan trọng
     - Không thêm thông tin không có trong dữ liệu
+    - Không trả về hình ảnh, link hình ảnh và fileds hình ảnh
     """
     try:
         response = model.generate_content(prompt)
@@ -200,7 +201,9 @@ Câu hỏi: {user_question}
 Hướng dẫn:
 1. Trả lời ngắn gọn, thân thiện
 2. Nếu không có thông tin, nói "Xin lỗi, tôi chưa có thông tin về vấn đề này"
-3. Không bịa thông tin"""
+3. Không bịa thông tin
+4. Không trả về hình ảnh, link hình ảnh và fileds hình ảnh
+"""
         
         response = model.generate_content(prompt)
         return response.text if response and response.parts else "Xin lỗi, tôi chưa thể trả lời câu hỏi này."
@@ -211,8 +214,8 @@ Hướng dẫn:
 
 # --- Khởi tạo Flask ---
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:3000"], supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins=["http://localhost:3000"], async_mode='eventlet')
+CORS(app, origins=["https://reco-fe.vercel.app"], supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins=["https://reco-fe.vercel.app"], async_mode='eventlet')
 
 # --- Định nghĩa các phép biến đổi --- #
 new_transform = transforms.Compose([transforms.Resize((32, 32)),
